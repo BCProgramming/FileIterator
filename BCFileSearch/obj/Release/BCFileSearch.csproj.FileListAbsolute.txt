@@ -1,0 +1,7 @@
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\obj\Release\BCFileSearch.csprojResolveAssemblyReference.cache
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\bin\Release\BCFileSearch.dll
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\bin\Release\BCFileSearch.pdb
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\bin\Release\System.Interactive.Async.dll
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\bin\Release\System.Interactive.Async.xml
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\obj\Release\BCFileSearch.dll
+C:\Users\BC_Programming\Documents\Visual Studio 2012\Projects\FileIterator\BCFileSearch\obj\Release\BCFileSearch.pdb
