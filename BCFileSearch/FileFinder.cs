@@ -5,9 +5,11 @@ using System.ComponentModel;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Runtime.CompilerServices;
 using System.Runtime.Serialization;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Threading.Tasks;
 using BASeCamp.Search;
 
 namespace BCFileSearch
@@ -16,11 +18,12 @@ namespace BCFileSearch
     {
         public enum CompletionCauseEnum
         {
-            Complete_Success,
-            Complete_Cancelled
+            CompleteSuccess,
+            CompleteCancelled,
+            CompleteError
         }
 
-        private CompletionCauseEnum _completionCause = CompletionCauseEnum.Complete_Success;
+        private CompletionCauseEnum _completionCause = CompletionCauseEnum.CompleteSuccess;
 
         public CompletionCauseEnum CompletionCause
         {
@@ -51,6 +54,15 @@ namespace BCFileSearch
         }
     }
 
+    public class SearchErrorEventArgs : EventArgs
+    {
+        public Exception ExceptionCause { get; set; } = null;
+
+        public SearchErrorEventArgs(Exception ErrorCause)
+        {
+            ExceptionCause = ErrorCause;
+        }
+    }
     public class SearchAlreadyInProgressException : Exception
     {
         public SearchAlreadyInProgressException(SerializationInfo info, StreamingContext context) : base(info, context)
@@ -71,7 +83,7 @@ namespace BCFileSearch
         private String _SearchDirectory = "";
         private String _SearchMask = "*";
 
-     
+
         private FilterDelegate FileFilter = null;
         private FilterDelegate DirectoryRecursionFilter = null;
         private Thread SearchThread = null;
@@ -80,6 +92,7 @@ namespace BCFileSearch
 
         public event EventHandler<AsyncFileFindCompleteEventArgs> AsyncFileFindComplete;
         public event EventHandler<AsyncFileFoundEventArgs> AsyncFileFound;
+        public event EventHandler<SearchErrorEventArgs> AsyncSearchError;
         public String SearchDirectory
         {
             get { return _SearchDirectory; }
@@ -105,30 +118,33 @@ namespace BCFileSearch
             _Cancelled = true;
         }
 
+        private void FireAsyncSearchError(Exception source)
+        {
+            SearchErrorEventArgs serror = new SearchErrorEventArgs(source);
+            var copied = AsyncSearchError;
+            copied?.Invoke(this, serror);
+        }
         private void FireAsyncFileFound(AsyncFileFoundEventArgs e)
         {
             lock (this)
             {
                 var copied = AsyncFileFound;
-                if (copied != null) copied(this, e);
+                copied?.Invoke(this, e);
             }
         }
 
         private void FireAsyncFileFindComplete(AsyncFileFindCompleteEventArgs.CompletionCauseEnum completionCauseEnum)
         {
             var copied = AsyncFileFindComplete;
-            if (copied != null) copied(this, new AsyncFileFindCompleteEventArgs(completionCauseEnum));
+            copied?.Invoke(this, new AsyncFileFindCompleteEventArgs(completionCauseEnum));
         }
 
         public void FireAsyncFileFindComplete()
         {
-            FireAsyncFileFindComplete(AsyncFileFindCompleteEventArgs.CompletionCauseEnum.Complete_Success);
+            FireAsyncFileFindComplete(AsyncFileFindCompleteEventArgs.CompletionCauseEnum.CompleteSuccess);
         }
 
-        public bool IsSearching
-        {
-            get { return _IsSearching; }
-        }
+        public bool IsSearching => _IsSearching;
 
         public bool HasResults()
         {
@@ -144,7 +160,8 @@ namespace BCFileSearch
             return ResultItem;
         }
 
-        public AsyncFileFinder(String pSearchDirectory, String pSearchMask, FilterDelegate pFileFilter = null, FilterDelegate pDirectoryRecursionFilter = null,
+        public AsyncFileFinder(String pSearchDirectory, String pSearchMask, FilterDelegate pFileFilter = null,
+            FilterDelegate pDirectoryRecursionFilter = null,
             bool pIsChild = false)
         {
             _SearchDirectory = pSearchDirectory;
@@ -153,7 +170,7 @@ namespace BCFileSearch
             DirectoryRecursionFilter = pDirectoryRecursionFilter;
             isChild = pIsChild;
         }
-
+ 
         public void Start()
         {
             //let's default our Filters if they aren't provided.
@@ -176,115 +193,143 @@ namespace BCFileSearch
 
         public void StartSync()
         {
-            ChildDirectorySearchers = new List<AsyncFileFinder>();
-            Debug.Print("StartSync Called, Searching in " + _SearchDirectory + " For Mask " + _SearchMask);
-            String sSearch = Path.Combine(_SearchDirectory, "*");
-            Queue<String> Directories = new Queue<string>();
-            //Task: 
-            //First, Search our folder for matching files and add them to the queue of results.
-            Debug.Print("Searching for files in folder");
-            NativeMethods.WIN32_FIND_DATA FindData;
-            IntPtr fHandle = NativeMethods.FindFirstFile(sSearch, out FindData);
-            while (fHandle != IntPtr.Zero)
+            Exception searchError = null;
+            try
             {
-                if (_Cancelled)
+                lock (ChildDirectorySearchers)
                 {
-                    FireAsyncFileFindComplete(AsyncFileFindCompleteEventArgs.CompletionCauseEnum.Complete_Cancelled);
-                    return;
+                    ChildDirectorySearchers = new List<AsyncFileFinder>();
                 }
-                //if the result is a Directory, add it to the list of result directories if it passes the recursion test.
-                if ((FindData.dwFileAttributes & FileAttributes.Directory) == FileAttributes.Directory)
+                Debug.Print("StartSync Called, Searching in " + _SearchDirectory + " For Mask " + _SearchMask);
+                String sSearch = Path.Combine(_SearchDirectory, "*");
+                Queue<String> directories = new Queue<string>();
+                //Task: 
+                //First, Search our folder for matching files and add them to the queue of results.
+                Debug.Print("Searching for files in folder");
+                NativeMethods.WIN32_FIND_DATA findData;
+                IntPtr fHandle = NativeMethods.FindFirstFile(sSearch, out findData);
+                while (fHandle != IntPtr.Zero)
                 {
-                    if (FindData.Filename != "." && FindData.Filename != "..")
-                        if (DirectoryRecursionFilter(new FileSearchResult(FindData, Path.Combine(sSearch, FindData.Filename))))
-                        {
-                            Debug.Print("Found Directory:" + FindData.Filename + " Adding to Directory Queue.");
-                            Directories.Enqueue(FindData.Filename);
-                        }
-                }
-                else if (FindData.Filename.Length > 0)
-                {
-                    //make sure it matches the given mask.
-                    if (FitsMask(FindData.Filename, _SearchMask))
+                    if (_Cancelled)
                     {
-                        FileSearchResult fsr = new FileSearchResult(FindData, Path.Combine(_SearchDirectory, FindData.Filename));
-                        if (FileFilter(fsr) && !_Cancelled)
+                        FireAsyncFileFindComplete(AsyncFileFindCompleteEventArgs.CompletionCauseEnum.CompleteCancelled);
+                        return;
+                    }
+                    //if the result is a Directory, add it to the list of result directories if it passes the recursion test.
+                    if ((findData.dwFileAttributes & FileAttributes.Directory) == FileAttributes.Directory)
+                    {
+                        if (findData.Filename != "." && findData.Filename != "..")
+                            if (
+                                DirectoryRecursionFilter(new FileSearchResult(findData,
+                                    Path.Combine(sSearch, findData.Filename))))
+                            {
+                                Debug.Print("Found Directory:" + findData.Filename + " Adding to Directory Queue.");
+                                directories.Enqueue(findData.Filename);
+                            }
+                    }
+                    else if (findData.Filename.Length > 0)
+                    {
+                        //make sure it matches the given mask.
+                        if (FitsMask(findData.Filename, _SearchMask))
                         {
-                            Debug.Print("Found File " + fsr.FullPath + " Raising Found event.");
-                            FireAsyncFileFound(new AsyncFileFoundEventArgs(fsr));
+                            FileSearchResult fsr = new FileSearchResult(findData,
+                                Path.Combine(_SearchDirectory, findData.Filename));
+                            if (FileFilter(fsr) && !_Cancelled)
+                            {
+                                Debug.Print("Found File " + fsr.FullPath + " Raising Found event.");
+                                FireAsyncFileFound(new AsyncFileFoundEventArgs(fsr));
+                            }
                         }
                     }
+                    findData = new NativeMethods.WIN32_FIND_DATA();
+                    if (!NativeMethods.FindNextFile(fHandle, out findData))
+                    {
+                        Debug.Print("FindNextFile returned False, closing handle...");
+                        NativeMethods.FindClose(fHandle);
+                        fHandle = IntPtr.Zero;
+                    }
                 }
-                FindData = new NativeMethods.WIN32_FIND_DATA();
-                if (!NativeMethods.FindNextFile(fHandle, out FindData))
-                {
-                    Debug.Print("FindNextFile returned False, closing handle...");
-                    NativeMethods.FindClose(fHandle);
-                    fHandle = IntPtr.Zero;
-                }
-            }
 
 
-            //find all directories in the search folder which also satisfy the Recursion test.
-            //Construct a new AsyncFileFinder to search within that folder with the same Mask and delegates for each one.
-            //Allow MaxChildren to run at once. When a running filefinder raises it's complete event, remove it from the List, and start up one of the ones that have not been run.
-            //if isChild is true, we won't actually multithread this task at all.
+                //find all directories in the search folder which also satisfy the Recursion test.
+                //Construct a new AsyncFileFinder to search within that folder with the same Mask and delegates for each one.
+                //Allow MaxChildren to run at once. When a running filefinder raises it's complete event, remove it from the List, and start up one of the ones that have not been run.
+                //if isChild is true, we won't actually multithread this task at all.
 
-            Debug.Print("File Search completed. Starting search of " + Directories.Count + " directories found in folder " + _SearchDirectory);
-            while (Directories.Count > 0 || ChildDirectorySearchers.Count > 0)
-            {
-                if (_Cancelled)
+                Debug.Print("File Search completed. Starting search of " + directories.Count +
+                            " directories found in folder " + _SearchDirectory);
+                while (directories.Count > 0 || ChildDirectorySearchers.Count > 0)
                 {
-                    break;
-                }
-                while (ChildDirectorySearchers.Count >= MaxChildren) Thread.Sleep(5);
-                //add enough AsyncFileFinders to the ChildDirectorySearchers bag to hit the MaxChildren limit.
+                    if (_Cancelled)
+                    {
+                        break;
+                    }
+                    while (ChildDirectorySearchers.Count >= MaxChildren) Thread.Sleep(5);
+                    //add enough AsyncFileFinders to the ChildDirectorySearchers bag to hit the MaxChildren limit.
 
-                if (Directories.Count == 0)
-                {
-                    Debug.Print("No directories left. Waiting for Child Search instances to complete.");
-                    Thread.Sleep(5);
-                    continue;
-                }
-                Debug.Print("There are " + ChildDirectorySearchers.Count + " Searchers active. Starting more.");
-                String startchilddir = Directories.Dequeue();
-                startchilddir = Path.Combine(_SearchDirectory, startchilddir);
-                AsyncFileFinder ChildSearcher = new AsyncFileFinder(startchilddir, _SearchMask, FileFilter, DirectoryRecursionFilter, true);
-                ChildSearcher.AsyncFileFound += (senderchild, foundevent) =>
-                {
-                    AsyncFileFinder source = senderchild as AsyncFileFinder;
+                    if (directories.Count == 0)
+                    {
+                        Debug.Print("No directories left. Waiting for Child Search instances to complete.");
+                        Thread.Sleep(5);
+                        continue;
+                    }
+                    Debug.Print("There are " + ChildDirectorySearchers.Count + " Searchers active. Starting more.");
+                    String startchilddir = directories.Dequeue();
+                    startchilddir = Path.Combine(_SearchDirectory, startchilddir);
+                    AsyncFileFinder ChildSearcher = new AsyncFileFinder(startchilddir, _SearchMask, FileFilter,
+                        DirectoryRecursionFilter, true);
+                    ChildSearcher.AsyncFileFound += (senderchild, foundevent) =>
+                    {
+                        AsyncFileFinder source = senderchild as AsyncFileFinder;
 
-                    if (!_Cancelled) FireAsyncFileFound(foundevent);
-                };
-                ChildSearcher.AsyncFileFindComplete += (ob, ev) =>
-                {
-                    AsyncFileFinder ChildSearch = (AsyncFileFinder) ob;
+                        if (!_Cancelled) FireAsyncFileFound(foundevent);
+                    };
+                    ChildSearcher.AsyncFileFindComplete += (ob, ev) =>
+                    {
+                        AsyncFileFinder ChildSearch = (AsyncFileFinder) ob;
+                        lock (ChildDirectorySearchers)
+                        {
+                            Debug.Print("Child Searcher " + ChildSearch.SearchDirectory +
+                                        " issued a completion event, removing from list.");
+                            ChildDirectorySearchers.Remove(ChildSearch);
+                        }
+                    };
+
                     lock (ChildDirectorySearchers)
                     {
-                        Debug.Print("Child Searcher " + ChildSearch.SearchDirectory + " issued a completion event, removing from list.");
-                        ChildDirectorySearchers.Remove(ChildSearch);
+                        ChildDirectorySearchers.Add(ChildSearcher);
                     }
-                };
 
-                ChildDirectorySearchers.Add(ChildSearcher);
-
-                if (!isChild)
-                {
-                    Debug.Print("Starting sub-search asynchronously");
-                    ChildSearcher.Start();
+                    if (!isChild)
+                    {
+                        Debug.Print("Starting sub-search asynchronously");
+                        ChildSearcher.Start();
+                    }
+                    else
+                    {
+                        Debug.Print("Starting sub-search synchronously");
+                        ChildSearcher.StartSync();
+                    }
                 }
-                else
-                {
-                    Debug.Print("Starting sub-search synchronously");
-                    ChildSearcher.StartSync();
-                }
+                Debug.Print("Exited Main Search Loop: Queue:" + directories.Count + " Child Searchers:" +
+                            ChildDirectorySearchers.Count);
             }
-            Debug.Print("Exited Main Search Loop: Queue:" + Directories.Count + " Child Searchers:" + ChildDirectorySearchers.Count);
-
+            catch (Exception exx)
+            {
+                searchError = exx;
+            }
 
             _IsSearching = false;
+            if (searchError != null)
+            {
+                FireAsyncSearchError(searchError);
+            }
+            var completecause = _Cancelled
+                ? AsyncFileFindCompleteEventArgs.CompletionCauseEnum.CompleteCancelled
+                : AsyncFileFindCompleteEventArgs.CompletionCauseEnum.CompleteSuccess;
+            if (searchError != null) completecause = AsyncFileFindCompleteEventArgs.CompletionCauseEnum.CompleteError; 
             FireAsyncFileFindComplete
-                (_Cancelled ? AsyncFileFindCompleteEventArgs.CompletionCauseEnum.Complete_Cancelled : AsyncFileFindCompleteEventArgs.CompletionCauseEnum.Complete_Success);
+                (completecause);
         }
     }
 }

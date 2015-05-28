@@ -31,7 +31,7 @@ namespace BCFileSearch
                 return FullPath;
             }
         }
-        public String FullPath { get { return SourceFile + ":" + _ADSName; } set { throw new NotImplementedException(); } }
+        public new String FullPath { get { return SourceFile + ":" + _ADSName; } set { throw new NotImplementedException(); } }
         public String ADSName { get { return _ADSName; } set { _ADSName = value; } }
         public override void Delete()
         {
